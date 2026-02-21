@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  aggregateSearch,
   buildFileUrl,
+  cacheSearchResults,
   getLyrics,
   getPlaylist,
+  getParsedUrl,
   getToplistSongs,
   getToplists,
   searchSongs,
@@ -11,6 +12,7 @@ import {
 import { useAppStore } from './store/useAppStore';
 import { useAuthStore } from './store/authStore';
 import { AuthModal } from './components/AuthModal';
+import { AdminModal } from './components/AdminModal';
 import { useMediaSession } from './hooks/useMediaSession';
 import { useTrayTitle } from './hooks/useTrayTitle';
 import type {
@@ -32,6 +34,7 @@ import { ToplistsView } from './components/ToplistsView';
 import { PlaylistDetailView } from './components/PlaylistDetailView';
 import { QueueView } from './components/QueueView';
 import { LibraryView } from './components/LibraryView';
+import { HistoryView } from './components/HistoryView';
 import { Modal } from './components/ui/Modal';
 import { ToastContainer } from './components/ui/Toast';
 import type { ToastMessage } from './components/ui/Toast';
@@ -54,9 +57,11 @@ const applyQualityToUrl = (rawUrl: string, quality: Quality): string => {
   }
 };
 
+const SEARCH_REQUEST_LIMIT = 30;
+
 function App() {
   // UI State
-  const [activeTab, setActiveTab] = useState<'search' | 'toplists' | 'library' | 'playlist'>('search');
+  const [activeTab, setActiveTab] = useState<'search' | 'toplists' | 'library' | 'playlist' | 'history'>('search');
   const [showLyrics, setShowLyrics] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [requestCloseLyrics, setRequestCloseLyrics] = useState(false); // 用于触发退出动画
@@ -72,8 +77,10 @@ function App() {
   const [isAddToPlaylistModalOpen, setIsAddToPlaylistModalOpen] = useState(false);
   const [songToAddToPlaylist, setSongToAddToPlaylist] = useState<Song | null>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
   const { user, token } = useAuthStore();
   const lastRecordedSongIdRef = useRef<string | null>(null);
+  const cachedSearchKeysRef = useRef<Set<string>>(new Set());
 
   const addToast = (type: ToastMessage['type'], message: string) => {
     const id = Date.now().toString();
@@ -90,7 +97,7 @@ function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
   const [keyword, setKeyword] = useState('');
-  const [searchSource, setSearchSource] = useState<'aggregate' | Platform>('aggregate');
+  const [searchSource, setSearchSource] = useState<Platform>('netease');
   const [searchResults, setSearchResults] = useState<Song[]>([]);
   const [searchPage, setSearchPage] = useState(1);
   const [searchTotal, setSearchTotal] = useState<number | undefined>(undefined);
@@ -102,7 +109,7 @@ function App() {
     const normalized = term.trim();
     if (!normalized) return;
 
-    const requestLimit = searchSource === 'aggregate' ? 10 : 30;
+    const requestLimit = SEARCH_REQUEST_LIMIT;
 
     if (resetLocked) {
       setSearchLockedFromPage(undefined);
@@ -114,9 +121,7 @@ function App() {
     setError(null);
 
     try {
-      const data = searchSource === 'aggregate'
-        ? await aggregateSearch(normalized, requestLimit, page)
-        : await searchSongs(searchSource, normalized, requestLimit, page);
+      const data = await searchSongs(searchSource, normalized, requestLimit, page);
 
       if (!data.results.length) {
         setSearchLockedFromPage((prev) => {
@@ -135,7 +140,7 @@ function App() {
       setSearchPage(page);
 
       const currentCount = data.total ?? data.results.length;
-      if (searchSource !== 'aggregate' && currentCount < requestLimit) {
+      if (currentCount < requestLimit) {
         setSearchLockedFromPage((prev) => {
           const lockPage = page + 1;
           return prev !== undefined ? Math.min(prev, lockPage) : lockPage;
@@ -152,6 +157,26 @@ function App() {
     } finally {
       setSearching(false);
     }
+  };
+
+  const cacheSearchResultIfNeeded = () => {
+    if (activeTab !== 'search') return;
+    const normalizedKeyword = keyword.trim();
+    if (!normalizedKeyword || !searchResults.length) return;
+
+    const cacheKey = `${searchSource}:${normalizedKeyword.toLowerCase()}:${searchPage}:${SEARCH_REQUEST_LIMIT}`;
+    if (cachedSearchKeysRef.current.has(cacheKey)) return;
+    cachedSearchKeysRef.current.add(cacheKey);
+
+    cacheSearchResults(searchSource, {
+      keyword: normalizedKeyword,
+      page: searchPage,
+      limit: SEARCH_REQUEST_LIMIT,
+      total: searchTotal ?? searchResults.length,
+      results: searchResults,
+    }).catch((err) => {
+      console.error('Failed to cache search result', err);
+    });
   };
 
   // Player State - 从 Zustand store 获取持久化状态
@@ -225,6 +250,10 @@ function App() {
     const pl = playlists.find(p => p.id === viewingPlaylist.id);
     if (pl) {
       setViewingPlaylist(pl);
+    } else {
+      // Playlist was deleted from the store — clear the stale view
+      setViewingPlaylist(null);
+      setActiveTab('library');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional: only sync when viewingPlaylist.id changes, not the full object
   }, [favorites, playlists, viewingPlaylist?.id]);
@@ -342,9 +371,6 @@ function App() {
   useEffect(() => {
     if (!currentSong || !audioRef.current) return;
     const audio = audioRef.current;
-    const src = currentSong.url
-      ? applyQualityToUrl(currentSong.url, quality)
-      : buildFileUrl(currentSong.platform, currentSong.id, 'url', quality);
 
     // Detect if this is a different song
     const songId = `${currentSong.platform}-${currentSong.id}`;
@@ -358,29 +384,82 @@ function App() {
       lastProgressRef.current = 0;
     }
 
-    audio.src = src;
+    let isCancelled = false;
+    const existingUrl = currentSong.url ? applyQualityToUrl(currentSong.url as string, quality) : '';
 
-    // Restore progress when same song loads (page refresh scenario)
-    const handleCanPlay = () => {
-      if (!hasRestoredProgressRef.current && savedProgress > 0 && isSameSong) {
-        audio.currentTime = savedProgress;
-        setProgress(savedProgress);
-        hasRestoredProgressRef.current = true;
+    const syncSongUrl = (finalUrl: string) => {
+      if (!currentSong || !finalUrl || currentSong.url === finalUrl) return;
+      const updatedSong = { ...currentSong, url: finalUrl };
+      setCurrentSong(updatedSong);
+      if (queueIndex >= 0 && queue[queueIndex]) {
+        const sameSong = queue[queueIndex]?.id === updatedSong.id && queue[queueIndex]?.platform === updatedSong.platform;
+        if (sameSong) {
+          const newQueue = [...queue];
+          newQueue[queueIndex] = updatedSong;
+          setQueue(newQueue);
+        }
       }
     };
 
-    audio.addEventListener('canplay', handleCanPlay, { once: true });
+    const playAudio = async () => {
+      let finalUrl = existingUrl;
 
-    if (shouldAutoPlayRef.current) {
-      audio.play().catch(() => setIsPlaying(false));
-    }
+      if (!finalUrl) {
+        try {
+          const parsed = await getParsedUrl(currentSong.platform, currentSong.id, quality);
+          if (isCancelled) return;
+          finalUrl = applyQualityToUrl(parsed, quality);
+          syncSongUrl(finalUrl);
+        } catch (e) {
+          console.error('Failed to parse song url', e);
+          addToast('error', '无法获取播放链接');
+          setIsPlaying(false);
+          return;
+        }
+      } else {
+        // Ensure queue/store also have quality-adjusted URL
+        syncSongUrl(finalUrl);
+      }
 
-    loadSongDetails(currentSong);
+      if (isCancelled || !finalUrl) return;
+
+      // Check if src actually changed to avoid reloading same buffer
+      if (audio.src !== finalUrl) {
+        audio.src = finalUrl;
+      }
+
+      // Restore progress when same song loads (page refresh scenario)
+      const handleCanPlay = () => {
+        if (!hasRestoredProgressRef.current && savedProgress > 0 && isSameSong) {
+          audio.currentTime = savedProgress;
+          setProgress(savedProgress);
+          hasRestoredProgressRef.current = true;
+        }
+      };
+
+      // If we are already ready to play, handle encoded progress
+      if (audio.readyState >= 3) {
+        handleCanPlay();
+      } else {
+        audio.addEventListener('canplay', handleCanPlay, { once: true });
+      }
+
+      if (shouldAutoPlayRef.current) {
+        audio.play().catch(() => setIsPlaying(false));
+      }
+
+      loadSongDetails(finalUrl ? { ...currentSong, url: finalUrl } : currentSong);
+    };
+
+    playAudio();
 
     return () => {
-      audio.removeEventListener('canplay', handleCanPlay);
+      isCancelled = true;
+      // Cleanup listener if it wasn't triggered
+      // Note: anonymous function passed to addEventListener above cannot be removed easily unless named
+      // But since we use {once: true}, it cleans itself up mostly.
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional: savedProgress only needed on initial load
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional
   }, [currentSong, quality]);
 
   // --- Sleep Timer Logic ---
@@ -528,11 +607,12 @@ function App() {
   };
 
   const playSong = (song: Song) => {
+    cacheSearchResultIfNeeded();
     const idx = queue.findIndex(s => s.id === song.id && s.platform === song.platform);
     if (idx >= 0) {
-      setQueueIndex(idx);
-      shouldAutoPlayRef.current = true;
-      setCurrentSong(queue[idx]);
+        setQueueIndex(idx);
+        shouldAutoPlayRef.current = true;
+        setCurrentSong(queue[idx]);
     } else {
       const newQueue = [...queue, song];
       setQueue(newQueue);
@@ -637,7 +717,10 @@ function App() {
   const handleDeletePlaylistConfirm = () => {
     if (playlistToDelete) {
       storeDeletePlaylist(playlistToDelete);
-      if (viewingPlaylist?.id === playlistToDelete) setActiveTab('library');
+      if (viewingPlaylist?.id === playlistToDelete) {
+        setViewingPlaylist(null);
+        setActiveTab('library');
+      }
       addToast('success', '歌单已删除');
       setPlaylistToDelete(null);
     }
@@ -648,6 +731,13 @@ function App() {
     setLoadingPlaylist(true);
     try {
       const data = await getPlaylist(playlistSource, id.trim());
+
+      // Check if playlist has songs
+      if (!data.list || data.list.length === 0) {
+        addToast('error', '歌单为空或无法获取歌曲列表');
+        return;
+      }
+
       const imported = toLocalPlaylist(data, {
         id: `import-${playlistSource}-${Date.now()}`,
         name: data.info?.name || '导入歌单',
@@ -657,25 +747,32 @@ function App() {
         desc: data.info?.desc,
       });
       addPlaylist(imported);
-      addToast('success', `成功导入歌单：${imported.name}`);
-    } catch {
-      addToast('error', '导入失败，请检查ID或链接');
+      addToast('success', `成功导入歌单：${imported.name} (${imported.songs.length}首)`);
+    } catch (error) {
+      console.error('Import playlist error:', error);
+      const errorMessage = error instanceof Error ? error.message : '未知错误';
+      addToast('error', `导入失败: ${errorMessage}`);
     } finally {
       setLoadingPlaylist(false);
     }
   };
 
-  // --- Toplist Logic ---
-
   useEffect(() => {
-    if (activeTab === 'toplists') {
-      fetchToplists();
+    // Determine if we need to auto-trigger search
+    // We only want to auto-trigger if:
+    // 1. There is a keyword
+    // 2. We are on the search tab
+    // 3. The source changed (captured by dependency array)
+    if (activeTab === 'search' && keyword.trim()) {
+      performSearch({ page: 1, term: keyword, resetLocked: true });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional: fetchToplists is defined outside and stable
-  }, [activeTab, toplistSource]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional: only trigger on searchSource change if other conditions met
+  }, [searchSource]);
 
   const fetchToplists = async () => {
     setLoadingToplists(true);
+    // Clear previous list to show "refreshing" state
+    setToplists([]);
     try {
       const list = await getToplists(toplistSource);
       setToplists(list);
@@ -685,6 +782,13 @@ function App() {
       setLoadingToplists(false);
     }
   };
+
+  useEffect(() => {
+    if (activeTab === 'toplists') {
+      fetchToplists();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentional: fetchToplists is defined outside and stable
+  }, [activeTab, toplistSource]);
 
   // Media Session API integration for browser/OS media notifications
   useMediaSession({
@@ -756,19 +860,39 @@ function App() {
           activePlaylistId={viewingPlaylist?.id || ''}
           onPlaylistSelect={(id) => {
             if (id === FAVORITES_ID) {
-              setViewingPlaylist(buildFavoritesPlaylist(favorites));
+              const favPlaylist = buildFavoritesPlaylist(favorites);
+              setViewingPlaylist(favPlaylist);
               setActiveTab('playlist');
+              // Update queue with favorites songs without auto-playing
+              if (favPlaylist.songs.length > 0) {
+                setQueue(favPlaylist.songs);
+                setQueueIndex(0);
+                // Only update currentSong if there isn't one playing
+                if (!currentSong) {
+                  setCurrentSong(favPlaylist.songs[0]);
+                }
+              }
               return;
             }
             const pl = playlists.find(p => p.id === id);
             if (pl) {
               setViewingPlaylist(pl);
               setActiveTab('playlist');
+              // Update queue with playlist songs without auto-playing
+              if (pl.songs.length > 0) {
+                setQueue(pl.songs);
+                setQueueIndex(0);
+                // Only update currentSong if there isn't one playing
+                if (!currentSong) {
+                  setCurrentSong(pl.songs[0]);
+                }
+              }
             }
           }}
           onCreatePlaylist={createPlaylist}
           onDeletePlaylist={deletePlaylist}
           onOpenAuth={() => setIsAuthModalOpen(true)}
+          onOpenAdmin={() => setIsAdminModalOpen(true)}
           user={user}
         />
       }
@@ -880,7 +1004,7 @@ function App() {
                 await performSearch({ page: 1, term, resetLocked: true });
               }}
               page={searchPage}
-              limit={30}
+            limit={SEARCH_REQUEST_LIMIT}
               total={searchTotal}
               lockedFromPage={searchLockedFromPage}
               onPageChange={async (page) => {
@@ -940,24 +1064,32 @@ function App() {
                       try {
                         const data = await getToplistSongs(toplistSource, id);
                         const summary = toplists.find(t => t.id === id);
-                        const tempPlaylist = toLocalPlaylist(
-                          { list: data.list, source: data.source },
-                          {
-                            id: `toplist-${id}`,
-                            name: summary?.name || '排行榜',
-                            source: toplistSource,
-                            origin: summary?.updateFrequency,
-                            pic: summary?.pic,
-                            url: summary?.url,
-                          },
-                        );
-                        setViewingPlaylist(tempPlaylist);
-                        setActiveTab('playlist');
-                      } catch (e) {
-                        console.error(e);
+                    const tempPlaylist = toLocalPlaylist(
+                      { list: data.list, source: data.source },
+                      {
+                        id: `toplist-${id}`,
+                        name: summary?.name || '排行榜',
+                        source: toplistSource,
+                        origin: summary?.updateFrequency,
+                        pic: summary?.pic,
+                        url: summary?.url,
+                      },
+                    );
+                    setViewingPlaylist(tempPlaylist);
+                    setActiveTab('playlist');
+                    // 当从排行榜进入播放页时，预先把整张榜单放入队列，方便连续播放
+                    if (tempPlaylist.songs.length > 0) {
+                      setQueue(tempPlaylist.songs);
+                      setQueueIndex(0);
+                      if (!currentSong) {
+                        setCurrentSong(tempPlaylist.songs[0]);
                       }
-                    }}
-                  />
+                    }
+                  } catch (e) {
+                    console.error(e);
+                  }
+                }}
+              />
                 </div>
               </div>
             </div>
@@ -994,7 +1126,14 @@ function App() {
             />
           </motion.div>
         )}
-
+        {activeTab === 'history' && (
+          <HistoryView
+            currentSong={currentSong}
+            isPlaying={isPlaying}
+            onPlay={playSong}
+            onPlayAll={startPlayback}
+          />
+        )}
         {activeTab === 'playlist' && viewingPlaylist && (
           <motion.div
             key={`playlist-${viewingPlaylist.id}`}
@@ -1209,7 +1348,15 @@ function App() {
       >
         <p className="text-gray-300">确定要删除这个歌单吗？此操作无法撤销。</p>
       </Modal>
-      <AuthModal isOpen={isAuthModalOpen} onClose={() => setIsAuthModalOpen(false)} />
+      <AuthModal
+        isOpen={isAuthModalOpen || !token}
+        onClose={() => setIsAuthModalOpen(false)}
+        canClose={!!token}
+      />
+      <AdminModal
+        isOpen={isAdminModalOpen}
+        onClose={() => setIsAdminModalOpen(false)}
+      />
     </Layout>
   );
 }
