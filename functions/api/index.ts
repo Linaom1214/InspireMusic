@@ -1756,6 +1756,83 @@ export const onRequest: PagesFunction<Env> = async (context) => {
                         console.error('Netease toplist api fallback error:', err);
                     }
                 }
+
+                // --- Netease playlist: use v6 API + song/detail to get ALL tracks ---
+                if (type === 'playlist') {
+                    try {
+                        const neteaseHeaders = {
+                            'Referer': 'https://music.163.com/',
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        };
+
+                        // Step 1: Get playlist detail with trackIds via v6 API
+                        const detailResp = await fetch('https://music.163.com/api/v6/playlist/detail', {
+                            method: 'POST',
+                            headers: neteaseHeaders,
+                            body: `id=${id}&n=100000&s=8`,
+                        });
+                        const detailData = await detailResp.json() as any;
+                        const playlist = detailData.playlist || detailData.result || {};
+                        const trackIds: number[] = (playlist.trackIds || []).map((t: any) => t.id);
+                        const partialTracks: any[] = playlist.tracks || [];
+
+                        // Step 2: If we have all tracks already, use them directly
+                        if (partialTracks.length >= trackIds.length) {
+                            parsedList = partialTracks.map((s: any) => normalizeSongItem(s, 'netease'));
+                        } else if (trackIds.length > 0) {
+                            // Step 3: Batch fetch song details for remaining track IDs
+                            // Use the IDs we already have from partial tracks
+                            const existingIds = new Set(partialTracks.map((t: any) => t.id));
+                            const missingIds = trackIds.filter(tid => !existingIds.has(tid));
+
+                            // Start with partial tracks we already have
+                            parsedList = partialTracks.map((s: any) => normalizeSongItem(s, 'netease'));
+
+                            // Fetch missing tracks in batches of 200
+                            const BATCH_SIZE = 200;
+                            for (let i = 0; i < missingIds.length; i += BATCH_SIZE) {
+                                const batch = missingIds.slice(i, i + BATCH_SIZE);
+                                try {
+                                    const songResp = await fetch('https://music.163.com/api/song/detail', {
+                                        method: 'POST',
+                                        headers: neteaseHeaders,
+                                        body: `ids=[${batch.join(',')}]`,
+                                    });
+                                    const songData = await songResp.json() as any;
+                                    const songs = songData.songs || [];
+                                    parsedList.push(...songs.map((s: any) => normalizeSongItem(s, 'netease')));
+                                } catch (batchErr) {
+                                    console.error(`Netease song/detail batch error (offset ${i}):`, batchErr);
+                                }
+                            }
+
+                            // Re-sort to match original trackIds order
+                            const idOrder = new Map(trackIds.map((tid, idx) => [String(tid), idx]));
+                            parsedList.sort((a, b) => (idOrder.get(a.id) ?? 9999) - (idOrder.get(b.id) ?? 9999));
+                        }
+
+                        const info = playlist;
+                        return new Response(JSON.stringify({
+                            code: 0,
+                            data: {
+                                info: {
+                                    id: String(info.id || id || ''),
+                                    name: String(info.name || ''),
+                                    desc: String(info.description || info.desc || ''),
+                                    author: String(info.creator?.nickname || info.author || ''),
+                                    pic: String(info.coverImgUrl || info.pic || ''),
+                                    playCount: Number(info.playCount || info.playnum || 0)
+                                },
+                                list: parsedList
+                            }
+                        }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+                    } catch (err) {
+                        console.error('Netease playlist v6 error:', err);
+                        // Fall through to method-based approach below
+                    }
+                }
+
                 if (!parsedList.length) {
                     try {
                         const playlistVars = type === 'playlist'
@@ -1767,8 +1844,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
                             : extractSearchList(data);
                         parsedList = songList.map((s: any) => normalizeSongItem(s, 'netease'));
 
-                        // Netease: playlist info lives at data.result (not data.result.playlist)
-                        const info = data.result || data.playlist || data.data?.playlist || data.result?.playlist || {};
+                        const info = data.result || data.playlist || data.data?.playlist || {};
                         return new Response(JSON.stringify({
                             code: 0,
                             data: type === 'playlist' ? {
